@@ -4,13 +4,13 @@ on:
   workflow_call:
     inputs:
       runner:
-        description: 'Runner to use (leave empty for auto-detect)'
+        description: "Runner to use (leave empty for auto-detect)"
         type: string
-        default: ''
+        default: ""
       mention_trigger:
-        description: 'Username to trigger on (e.g., @codex)'
+        description: "Username to trigger on (e.g., @codex)"
         type: string
-        default: '@codex'
+        default: "@codex"
     secrets:
       OPENAI_API_KEY:
         required: true
@@ -28,7 +28,7 @@ jobs:
     runs-on: ${{ inputs.runner != '' && inputs.runner || (github.repository_visibility == 'private' && fromJSON('["self-hosted", "linux", "x64"]') || 'ubuntu-latest') }}
     container:
       image: node:20-bullseye
-    timeout-minutes: 15
+    timeout-minutes: 120
     permissions:
       contents: write
       pull-requests: write
@@ -50,7 +50,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
 
       - name: Install dependencies
         run: |
