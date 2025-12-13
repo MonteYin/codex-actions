@@ -62,10 +62,15 @@ jobs:
     secrets: inherit
 
   # Mention Response - Respond to @codex mentions
+  # Security: Only OWNER/MEMBER/COLLABORATOR can trigger, Bots excluded
   mention-response:
-    if: |
+    if: >-
       (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment') &&
-      contains(github.event.comment.body, '@codex')
+      contains(github.event.comment.body, '@codex') &&
+      github.event.sender.type != 'Bot' &&
+      (github.event.comment.author_association == 'OWNER' ||
+       github.event.comment.author_association == 'MEMBER' ||
+       github.event.comment.author_association == 'COLLABORATOR')
     uses: MonteYin/codex-actions/.github/workflows/reusable-mention-responder.yml@v1
     secrets: inherit
 
