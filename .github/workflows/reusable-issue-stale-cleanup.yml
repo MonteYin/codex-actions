@@ -76,6 +76,7 @@ jobs:
           CODEX_HOME: ${{ runner.temp }}/codex-home
           STALE_DAYS: ${{ inputs.stale_days }}
           CLOSE_DAYS: ${{ inputs.close_days }}
+        shell: bash
         run: |
           mkdir -p "$CODEX_HOME"
           MODEL="${{ secrets.CODEX_MODEL }}"

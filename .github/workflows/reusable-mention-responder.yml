@@ -97,6 +97,7 @@ jobs:
           CONTEXT_TYPE: ${{ steps.context.outputs.type }}
           CONTEXT_NUMBER: ${{ steps.context.outputs.number }}
           REPOSITORY: ${{ github.repository }}
+        shell: bash
         run: |
           mkdir -p "$CODEX_HOME"
           MODEL="${{ secrets.CODEX_MODEL }}"

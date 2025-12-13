@@ -106,6 +106,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+        shell: bash
         run: |
           mkdir -p "$CODEX_HOME"
           MODEL="${{ secrets.CODEX_MODEL }}"

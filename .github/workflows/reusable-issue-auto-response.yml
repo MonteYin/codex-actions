@@ -81,6 +81,7 @@ jobs:
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_BODY: ${{ github.event.issue.body }}
           REPOSITORY: ${{ github.repository }}
+        shell: bash
         run: |
           mkdir -p "$CODEX_HOME"
           MODEL="${{ secrets.CODEX_MODEL }}"
