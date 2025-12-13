@@ -1,0 +1,29 @@
+# Codex GitHub Automation - Minimal Setup
+# Copy to: .github/workflows/codex.yml
+#
+# Required secrets:
+#   - OPENAI_API_KEY
+# Optional secrets:
+#   - CODEX_MODEL (default: gpt-5.2)
+#   - CODEX_REASONING_EFFORT (default: xhigh)
+
+name: Codex
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issues:
+    types: [opened]
+
+jobs:
+  # PR Review - AI code review with inline comments
+  pr-review:
+    if: github.event_name == 'pull_request'
+    uses: MonteYin/codex-actions/.github/workflows/reusable-pr-review.yml@v1
+    secrets: inherit
+
+  # Issue Label + Issue Dedupe - Classification and duplicate detection
+  issue-triage:
+    if: github.event_name == 'issues'
+    uses: MonteYin/codex-actions/.github/workflows/reusable-issue-triage.yml@v1
+    secrets: inherit
