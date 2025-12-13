@@ -190,6 +190,13 @@ codex-actions/
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
+### Development
+
+1. Fork the repository
+2. Create your feature branch
+3. Make your changes
+4. Submit a pull request
+
 ## License
 
 MIT
