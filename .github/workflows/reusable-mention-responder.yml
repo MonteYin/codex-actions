@@ -1,0 +1,142 @@
+name: Reusable Mention Responder
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: "Runner to use (leave empty for auto-detect)"
+        type: string
+        default: ""
+      mention_trigger:
+        description: "Username to trigger on (e.g., @codex)"
+        type: string
+        default: "@codex"
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+      OPENAI_BASE_URL:
+        required: false
+      CODEX_MODEL:
+        required: false
+      CODEX_REASONING_EFFORT:
+        required: false
+
+jobs:
+  respond:
+    name: Mention Response
+    if: "!endsWith(github.actor, '[bot]')"
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.repository_visibility == 'private' && fromJSON('["self-hosted", "linux", "x64"]') || 'ubuntu-latest') }}
+    container:
+      image: node:20-bullseye
+    timeout-minutes: 120
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout prompts
+        uses: actions/checkout@v4
+        with:
+          repository: MonteYin/codex-actions
+          path: .codex-actions
+          sparse-checkout: .github/prompts
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: |
+          apt-get update && apt-get install -y jq curl
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          apt-get update && apt-get install -y gh
+          npm install -g @openai/codex
+
+      - name: Determine context
+        id: context
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request_review_comment" ]; then
+            echo "type=pr_review" >> $GITHUB_OUTPUT
+            echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+          elif [ -n "${{ github.event.issue.pull_request }}" ]; then
+            echo "type=pr" >> $GITHUB_OUTPUT
+            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          else
+            echo "type=issue" >> $GITHUB_OUTPUT
+            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Gather context
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTEXT_TYPE: ${{ steps.context.outputs.type }}
+          CONTEXT_NUMBER: ${{ steps.context.outputs.number }}
+        run: |
+          if [ "$CONTEXT_TYPE" = "issue" ]; then
+            gh issue view "$CONTEXT_NUMBER" --repo "${{ github.repository }}" --json number,title,body,comments > /tmp/context.json
+          else
+            gh pr view "$CONTEXT_NUMBER" --repo "${{ github.repository }}" --json number,title,body,comments,files > /tmp/context.json
+            gh pr diff "$CONTEXT_NUMBER" --repo "${{ github.repository }}" > /tmp/pr-diff.txt 2>/dev/null || true
+          fi
+
+      - name: Run Codex
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          CONTEXT_TYPE: ${{ steps.context.outputs.type }}
+          CONTEXT_NUMBER: ${{ steps.context.outputs.number }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          mkdir -p "$CODEX_HOME"
+          MODEL="${{ secrets.CODEX_MODEL }}"
+          MODEL="${MODEL:-gpt-5.2}"
+          EFFORT="${{ secrets.CODEX_REASONING_EFFORT }}"
+          EFFORT="${EFFORT:-xhigh}"
+          cat > "$CODEX_HOME/config.toml" << TOML
+          model = "$MODEL"
+          model_reasoning_effort = "$EFFORT"
+          TOML
+          echo "{\"OPENAI_API_KEY\": \"${{ secrets.OPENAI_API_KEY }}\"}" > "$CODEX_HOME/auth.json"
+
+          PROMPT=$(cat .codex-actions/.github/prompts/mention-response.md)
+          PROMPT="${PROMPT//\$\{COMMENT_BODY\}/$COMMENT_BODY}"
+          PROMPT="${PROMPT//\$\{COMMENT_AUTHOR\}/$COMMENT_AUTHOR}"
+          PROMPT="${PROMPT//\$\{CONTEXT_TYPE\}/$CONTEXT_TYPE}"
+          PROMPT="${PROMPT//\$\{CONTEXT_NUMBER\}/$CONTEXT_NUMBER}"
+          PROMPT="${PROMPT//\$\{REPOSITORY\}/$REPOSITORY}"
+          codex exec --skip-git-repo-check --full-auto --output-last-message /tmp/codex-output.json "$PROMPT" || true
+
+      - name: Post Response
+        uses: actions/github-script@v7
+        env:
+          CONTEXT_NUMBER: ${{ steps.context.outputs.number }}
+        with:
+          script: |
+            const fs = require('fs');
+            if (!fs.existsSync('/tmp/codex-output.json')) return;
+
+            const output = fs.readFileSync('/tmp/codex-output.json', 'utf8').trim();
+            if (!output) return;
+
+            let result;
+            try { result = JSON.parse(output); } catch (e) { return; }
+
+            if (!result.should_respond || !result.response?.trim()) return;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: parseInt(process.env.CONTEXT_NUMBER),
+              body: result.response
+            });

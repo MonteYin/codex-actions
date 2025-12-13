@@ -1,0 +1,151 @@
+name: Reusable PR Label
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: 'Runner to use (leave empty for auto-detect)'
+        type: string
+        default: ''
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+      OPENAI_BASE_URL:
+        required: false
+      CODEX_MODEL:
+        required: false
+      CODEX_REASONING_EFFORT:
+        required: false
+
+jobs:
+  label:
+    name: PR Label
+    if: "!endsWith(github.actor, '[bot]')"
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.repository_visibility == 'private' && fromJSON('["self-hosted", "linux", "x64"]') || 'ubuntu-latest') }}
+    container:
+      image: node:20-bullseye
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Fetch base branch
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git fetch origin ${{ github.event.pull_request.base.ref }}
+
+      - name: Checkout prompts
+        uses: actions/checkout@v4
+        with:
+          repository: MonteYin/codex-actions
+          path: .codex-actions
+          sparse-checkout: .github/prompts
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          apt-get update && apt-get install -y jq curl
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          apt-get update && apt-get install -y gh
+          npm install -g @openai/codex
+
+      - name: Gather PR context
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git diff --name-only origin/${{ github.event.pull_request.base.ref }}...HEAD > /tmp/changed-files.txt
+          git diff --stat origin/${{ github.event.pull_request.base.ref }}...HEAD > /tmp/diff-stats.txt
+          gh label list --repo "${{ github.repository }}" --json name,description > /tmp/available-labels.json
+
+      - name: Run Codex Labeler
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        shell: bash
+        run: |
+          mkdir -p "$CODEX_HOME"
+          MODEL="${{ secrets.CODEX_MODEL }}"
+          MODEL="${MODEL:-gpt-5.2}"
+          EFFORT="${{ secrets.CODEX_REASONING_EFFORT }}"
+          EFFORT="${EFFORT:-xhigh}"
+          cat > "$CODEX_HOME/config.toml" << TOML
+          model = "$MODEL"
+          model_reasoning_effort = "$EFFORT"
+          TOML
+          echo "{\"OPENAI_API_KEY\": \"${{ secrets.OPENAI_API_KEY }}\"}" > "$CODEX_HOME/auth.json"
+
+          PROMPT=$(cat .codex-actions/.github/prompts/pr-label.md)
+          PROMPT="${PROMPT//\$\{PR_NUMBER\}/$PR_NUMBER}"
+          PROMPT="${PROMPT//\$\{PR_TITLE\}/$PR_TITLE}"
+          PROMPT="${PROMPT//\$\{PR_BODY\}/$PR_BODY}"
+          codex exec --skip-git-repo-check --full-auto --output-last-message /tmp/codex-output.json "$PROMPT" || true
+
+      - name: Apply Labels
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        with:
+          script: |
+            const fs = require('fs');
+            if (!fs.existsSync('/tmp/codex-output.json')) return;
+
+            const output = fs.readFileSync('/tmp/codex-output.json', 'utf8').trim();
+            if (!output) return;
+
+            let result;
+            try { result = JSON.parse(output); } catch (e) { return; }
+
+            const labels = result.labels || [];
+            if (labels.length === 0) return;
+
+            const labelDefs = {
+              'bug': { description: "Something isn't working", color: 'd73a4a' },
+              'enhancement': { description: 'New feature or request', color: 'a2eeef' },
+              'documentation': { description: 'Documentation changes', color: '0075ca' },
+              'refactor': { description: 'Code refactoring', color: 'fbca04' },
+              'test': { description: 'Test changes', color: 'bfd4f2' },
+              'chore': { description: 'Build/config changes', color: 'fef2c0' },
+              'breaking-change': { description: 'Breaking changes', color: 'b60205' },
+              'size/XS': { description: 'PR size: XS (<50 lines, <5 files)', color: 'c5def5' },
+              'size/S': { description: 'PR size: S (<200 lines, <10 files)', color: 'c5def5' },
+              'size/M': { description: 'PR size: M (<500 lines, <20 files)', color: 'c5def5' },
+              'size/L': { description: 'PR size: L (<1000 lines, <30 files)', color: 'c5def5' },
+              'size/XL': { description: 'PR size: XL (>=1000 lines or >=30 files)', color: 'c5def5' }
+            };
+
+            for (const label of labels) {
+              if (labelDefs[label]) {
+                try {
+                  await github.rest.issues.getLabel({ owner: context.repo.owner, repo: context.repo.repo, name: label });
+                } catch (e) {
+                  if (e.status === 404) {
+                    await github.rest.issues.createLabel({
+                      owner: context.repo.owner, repo: context.repo.repo,
+                      name: label, ...labelDefs[label]
+                    });
+                  }
+                }
+              }
+            }
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: parseInt(process.env.PR_NUMBER),
+              labels: labels.slice(0, 5)
+            });

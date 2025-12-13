@@ -1,0 +1,142 @@
+name: Reusable Issue Stale Cleanup
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: 'Runner to use (leave empty for auto-detect)'
+        type: string
+        default: ''
+      stale_days:
+        description: 'Days of inactivity before marking stale'
+        type: number
+        default: 30
+      close_days:
+        description: 'Days after stale before closing'
+        type: number
+        default: 14
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+      OPENAI_BASE_URL:
+        required: false
+      CODEX_MODEL:
+        required: false
+      CODEX_REASONING_EFFORT:
+        required: false
+
+jobs:
+  cleanup:
+    name: Issue Stale Cleanup
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.repository_visibility == 'private' && fromJSON('["self-hosted", "linux", "x64"]') || 'ubuntu-latest') }}
+    container:
+      image: node:20-bullseye
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Checkout prompts
+        uses: actions/checkout@v4
+        with:
+          repository: MonteYin/codex-actions
+          path: .codex-actions
+          sparse-checkout: .github/prompts
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          apt-get update && apt-get install -y jq curl
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          apt-get update && apt-get install -y gh
+          npm install -g @openai/codex
+
+      - name: Ensure stale label
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create stale --description "Issue has been inactive" --color "ededed" --repo "${{ github.repository }}" 2>/dev/null || true
+
+      - name: Fetch open issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue list --repo "${{ github.repository }}" --state open --json number,title,updatedAt,labels --limit 200 > /tmp/open-issues.json
+
+      - name: Run Codex
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+          STALE_DAYS: ${{ inputs.stale_days }}
+          CLOSE_DAYS: ${{ inputs.close_days }}
+        shell: bash
+        run: |
+          mkdir -p "$CODEX_HOME"
+          MODEL="${{ secrets.CODEX_MODEL }}"
+          MODEL="${MODEL:-gpt-5.2}"
+          EFFORT="${{ secrets.CODEX_REASONING_EFFORT }}"
+          EFFORT="${EFFORT:-xhigh}"
+          cat > "$CODEX_HOME/config.toml" << TOML
+          model = "$MODEL"
+          model_reasoning_effort = "$EFFORT"
+          TOML
+          echo "{\"OPENAI_API_KEY\": \"${{ secrets.OPENAI_API_KEY }}\"}" > "$CODEX_HOME/auth.json"
+
+          PROMPT=$(cat .codex-actions/.github/prompts/issue-stale.md)
+          PROMPT="${PROMPT//\$\{STALE_DAYS\}/$STALE_DAYS}"
+          PROMPT="${PROMPT//\$\{CLOSE_DAYS\}/$CLOSE_DAYS}"
+          codex exec --skip-git-repo-check --full-auto --output-last-message /tmp/codex-output.json "$PROMPT" || true
+
+      - name: Process Stale Issues
+        uses: actions/github-script@v7
+        env:
+          STALE_DAYS: ${{ inputs.stale_days }}
+          CLOSE_DAYS: ${{ inputs.close_days }}
+        with:
+          script: |
+            const fs = require('fs');
+            if (!fs.existsSync('/tmp/codex-output.json')) return;
+
+            const output = fs.readFileSync('/tmp/codex-output.json', 'utf8').trim();
+            if (!output) return;
+
+            let result;
+            try { result = JSON.parse(output); } catch (e) { return; }
+
+            const staleDays = process.env.STALE_DAYS;
+            const closeDays = process.env.CLOSE_DAYS;
+
+            for (const issue of (result.mark_stale || [])) {
+              try {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: issue.number, labels: ['stale']
+                });
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: issue.number,
+                  body: `This issue has been automatically marked as stale because it has not had any activity in the last ${staleDays} days.\n\nIf this issue is still relevant:\n- Please comment to keep it open\n- Add any new information that might help resolve it\n\nThis issue will be automatically closed in ${closeDays} days if there is no further activity.`
+                });
+              } catch (e) { console.log(`Failed to mark #${issue.number} stale: ${e.message}`); }
+            }
+
+            for (const issue of (result.close_stale || [])) {
+              try {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: issue.number,
+                  body: `This issue has been automatically closed due to inactivity.\n\nIf you believe this issue is still relevant, please feel free to reopen it with additional information.`
+                });
+                await github.rest.issues.update({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: issue.number,
+                  state: 'closed', state_reason: 'not_planned'
+                });
+              } catch (e) { console.log(`Failed to close #${issue.number}: ${e.message}`); }
+            }
+
+            console.log(`Marked ${(result.mark_stale || []).length} stale, closed ${(result.close_stale || []).length}`);

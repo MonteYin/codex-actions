@@ -1,0 +1,153 @@
+name: Reusable PR Review
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: "Runner to use (leave empty for auto-detect: ubuntu-latest for public, self-hosted for private)"
+        type: string
+        default: ""
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+      OPENAI_BASE_URL:
+        required: false
+      CODEX_MODEL:
+        required: false
+      CODEX_REASONING_EFFORT:
+        required: false
+
+jobs:
+  review:
+    name: PR Review
+    if: |
+      github.event.pull_request.draft == false &&
+      !endsWith(github.actor, '[bot]')
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.repository_visibility == 'private' && fromJSON('["self-hosted", "linux", "x64"]') || 'ubuntu-latest') }}
+    container:
+      image: node:20-bullseye
+    timeout-minutes: 120
+    concurrency:
+      group: pr-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Fetch base branch
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git fetch origin ${{ github.event.pull_request.base.ref }}
+
+      - name: Checkout prompts
+        uses: actions/checkout@v4
+        with:
+          repository: MonteYin/codex-actions
+          path: .codex-actions
+          sparse-checkout: .github/prompts
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: |
+          apt-get update && apt-get install -y jq curl
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          apt-get update && apt-get install -y gh
+          npm install -g @openai/codex
+
+      - name: Run Codex Review
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+        shell: bash
+        run: |
+          mkdir -p "$CODEX_HOME"
+          MODEL="${{ secrets.CODEX_MODEL }}"
+          MODEL="${MODEL:-gpt-5.2}"
+          EFFORT="${{ secrets.CODEX_REASONING_EFFORT }}"
+          EFFORT="${EFFORT:-xhigh}"
+          cat > "$CODEX_HOME/config.toml" << TOML
+          model = "$MODEL"
+          model_reasoning_effort = "$EFFORT"
+          TOML
+          echo "{\"OPENAI_API_KEY\": \"${{ secrets.OPENAI_API_KEY }}\"}" > "$CODEX_HOME/auth.json"
+
+          PROMPT=$(cat .codex-actions/.github/prompts/review.md)
+          codex exec --skip-git-repo-check --full-auto --output-last-message /tmp/codex-output.json "$PROMPT" || true
+
+      - name: Post Review
+        uses: actions/github-script@v7
+        env:
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        with:
+          script: |
+            const fs = require('fs');
+            if (!fs.existsSync('/tmp/codex-output.json')) return;
+
+            const output = fs.readFileSync('/tmp/codex-output.json', 'utf8').trim();
+            if (!output) return;
+
+            let review;
+            try { review = JSON.parse(output); } catch (e) { console.log('Parse failed:', output); return; }
+
+            const prNumber = parseInt(process.env.PR_NUMBER);
+            const commitSha = process.env.COMMIT_SHA;
+
+            const findings = review.findings || [];
+
+            for (const f of findings) {
+              if (!f.code_location?.absolute_file_path || !f.code_location?.line_range?.start) continue;
+
+              let body = `**${f.title}**\n\n${f.body}\n\n`;
+              if (f.suggestion) body += `**Suggested fix:**\n\`\`\`suggestion\n${f.suggestion}\n\`\`\`\n\n`;
+              body += `_Confidence: ${(f.confidence_score * 100).toFixed(0)}%_`;
+
+              try {
+                await github.rest.pulls.createReviewComment({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  pull_number: prNumber, commit_id: commitSha,
+                  path: f.code_location.absolute_file_path,
+                  line: f.code_location.line_range.end || f.code_location.line_range.start,
+                  side: 'RIGHT', body
+                });
+              } catch (e) { console.log(`Comment failed: ${e.message}`); }
+            }
+
+            const counts = { 0: 0, 1: 0, 2: 0, 3: 0 };
+            findings.forEach(f => counts[f.priority ?? 2]++);
+
+            const isCorrect = review.overall_correctness === 'patch is correct';
+            let summary = `## Code Review Summary\n\n`;
+            summary += `**Overall**: ${isCorrect ? '✅ Patch is correct' : '⚠️ Patch needs attention'} (confidence: ${(review.overall_confidence_score * 100).toFixed(0)}%)\n\n`;
+            summary += `${review.overall_explanation}\n\n`;
+
+            if (findings.length > 0) {
+              summary += `### Issues Found\n| Priority | Count |\n|----------|-------|\n`;
+              if (counts[0]) summary += `| 🔴 P0 Critical | ${counts[0]} |\n`;
+              if (counts[1]) summary += `| 🟠 P1 High | ${counts[1]} |\n`;
+              if (counts[2]) summary += `| 🟡 P2 Medium | ${counts[2]} |\n`;
+              if (counts[3]) summary += `| 🔵 P3 Low | ${counts[3]} |\n`;
+            } else {
+              summary += `### ✅ No Issues Found\n`;
+            }
+
+            summary += `\n---\n_Automated review by Codex AI_`;
+
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner, repo: context.repo.repo,
+              pull_number: prNumber, commit_id: commitSha, body: summary,
+              event: (counts[0] > 0 || counts[1] > 0) ? 'REQUEST_CHANGES' : 'COMMENT'
+            });
