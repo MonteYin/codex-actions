@@ -153,6 +153,46 @@ with:
 secrets: inherit
 ```
 
+### Research Tracker
+
+Track AI/ML repositories for research opportunities.
+
+**Workflows:**
+- `reusable-tracker-dispatcher.yml` - Orchestrates parallel repo analysis
+- `reusable-repo-tracker.yml` - Analyzes individual repositories
+
+**Usage:**
+
+```yaml
+# .github/workflows/research-tracker.yml
+name: Research Tracker
+
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+jobs:
+  track:
+    uses: MonteYin/codex-actions/.github/workflows/reusable-tracker-dispatcher.yml@main
+    with:
+      repos: ${{ vars.WATCHED_REPOS }}
+      webhook_url: ${{ vars.WEBHOOK_URL }}
+    secrets: inherit
+```
+
+**Configuration:**
+- `vars.WATCHED_REPOS` - Comma-separated repo list (e.g., `langchain-ai/langchain,openai/openai-python`)
+- `vars.WEBHOOK_URL` - Optional webhook for notifications
+- `secrets.OPENAI_API_KEY` - Required for Codex analysis
+
+**Features:**
+- Daily automated analysis of watched repositories
+- Identifies research opportunities (new architectures, performance gains, limitations)
+- Markdown reports with tracking backlog
+- Webhook notifications (per-repo and daily summary)
+- Automatic retry with failure alerts
+
 ## Configuration
 
 ### Secrets

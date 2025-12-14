@@ -91,3 +91,12 @@ OUTPUT FORMAT:
 * The suggestion field is optional but highly encouraged - it should contain the corrected code that can replace the affected lines.
 * Priority is required: 0=Critical, 1=High, 2=Medium, 3=Low.
 * Do not generate a PR fix.
+
+## COMMENT FILTER CRITERIA
+
+**Only findings meeting ALL of the following criteria will be posted as PR comments:**
+
+1. `confidence_score` > 0.80 (80%)
+2. `priority` is 0 (P0) or 1 (P1)
+
+Findings that do not meet these thresholds should still be included in the JSON output for logging purposes, but will be filtered out before posting to the PR. Focus your effort on high-confidence, high-priority issues.

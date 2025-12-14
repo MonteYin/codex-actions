@@ -1,0 +1,375 @@
+name: Reusable Repo Tracker
+
+on:
+  workflow_call:
+    inputs:
+      repo:
+        description: "Target repository (owner/repo)"
+        type: string
+        required: true
+      webhook_url:
+        description: "Webhook URL for per-repo report"
+        type: string
+        required: false
+        default: ""
+      lookback_hours:
+        description: "Hours to look back for activity"
+        type: number
+        required: false
+        default: 24
+      runner:
+        description: "Runner to use"
+        type: string
+        required: false
+        default: ""
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+      OPENAI_BASE_URL:
+        required: false
+      CODEX_MODEL:
+        required: false
+      CODEX_REASONING_EFFORT:
+        required: false
+
+jobs:
+  analyze:
+    name: Analyze ${{ inputs.repo }}
+    runs-on: ${{ inputs.runner != '' && inputs.runner || 'ubuntu-latest' }}
+    container:
+      image: node:20-bullseye
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ github.token }}
+
+      - name: Checkout prompts
+        uses: actions/checkout@v4
+        with:
+          repository: MonteYin/codex-actions
+          path: .codex-actions
+          sparse-checkout: .github/prompts
+
+      - name: Setup environment
+        run: |
+          apt-get update && apt-get install -y jq curl
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          apt-get update && apt-get install -y gh
+          npm install -g @openai/codex
+
+      - name: Clone target repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          OWNER=$(echo "${{ inputs.repo }}" | cut -d'/' -f1)
+          REPO=$(echo "${{ inputs.repo }}" | cut -d'/' -f2)
+          SINCE_DATE=$(date -d "${{ inputs.lookback_hours }} hours ago" --iso-8601=seconds 2>/dev/null || date -v-${{ inputs.lookback_hours }}H +%Y-%m-%dT%H:%M:%S%z)
+
+          git clone --depth 50 --shallow-since="$SINCE_DATE" "https://github.com/${{ inputs.repo }}.git" /tmp/target-repo || \
+          git clone --depth 50 "https://github.com/${{ inputs.repo }}.git" /tmp/target-repo
+
+      - name: Fetch GitHub API data
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          OWNER=$(echo "${{ inputs.repo }}" | cut -d'/' -f1)
+          REPO=$(echo "${{ inputs.repo }}" | cut -d'/' -f2)
+          SINCE_DATE=$(date -d "${{ inputs.lookback_hours }} hours ago" --iso-8601=seconds 2>/dev/null || date -v-${{ inputs.lookback_hours }}H +%Y-%m-%dT%H:%M:%S%z)
+
+          mkdir -p /tmp/api-data
+
+          # Fetch recent PRs
+          gh api "repos/$OWNER/$REPO/pulls?state=all&sort=updated&per_page=20" > /tmp/api-data/pulls.json || echo "[]" > /tmp/api-data/pulls.json
+
+          # Fetch recent issues
+          gh api "repos/$OWNER/$REPO/issues?state=all&sort=updated&per_page=20" > /tmp/api-data/issues.json || echo "[]" > /tmp/api-data/issues.json
+
+          # Fetch recent commits
+          gh api "repos/$OWNER/$REPO/commits?per_page=30" > /tmp/api-data/commits.json || echo "[]" > /tmp/api-data/commits.json
+
+      - name: Generate diff
+        run: |
+          cd /tmp/target-repo
+          git config --global --add safe.directory /tmp/target-repo
+
+          # Generate filtered diff
+          git log --oneline -50 > /tmp/commit-log.txt || echo "No commits" > /tmp/commit-log.txt
+
+          git diff HEAD~50..HEAD 2>/dev/null \
+            -- . \
+            ':!package-lock.json' \
+            ':!yarn.lock' \
+            ':!pnpm-lock.yaml' \
+            ':!poetry.lock' \
+            ':!Cargo.lock' \
+            ':!*.min.js' \
+            ':!*.min.css' \
+            ':!*.pb.go' \
+            ':!*.generated.*' \
+            > /tmp/processed_diff.txt || echo "No diff available" > /tmp/processed_diff.txt
+
+          # Truncate if too large (keep first 100KB)
+          head -c 102400 /tmp/processed_diff.txt > /tmp/diff_truncated.txt
+          mv /tmp/diff_truncated.txt /tmp/processed_diff.txt
+
+      - name: Load historical context
+        run: |
+          OWNER=$(echo "${{ inputs.repo }}" | cut -d'/' -f1)
+          REPO=$(echo "${{ inputs.repo }}" | cut -d'/' -f2)
+          REPORT_PATH="reports/$OWNER/$REPO.md"
+
+          if [ -f "$REPORT_PATH" ]; then
+            # Extract last 7 days of entries for context
+            head -200 "$REPORT_PATH" > /tmp/historical_context.md
+          else
+            echo "No historical context available" > /tmp/historical_context.md
+          fi
+
+      - name: Run Codex analysis
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+        run: |
+          mkdir -p "$CODEX_HOME"
+          MODEL="${{ secrets.CODEX_MODEL }}"
+          MODEL="${MODEL:-gpt-5.2}"
+          EFFORT="${{ secrets.CODEX_REASONING_EFFORT }}"
+          EFFORT="${EFFORT:-high}"
+
+          cat > "$CODEX_HOME/config.toml" << TOML
+          model = "$MODEL"
+          model_reasoning_effort = "$EFFORT"
+          TOML
+          echo "{\"OPENAI_API_KEY\": \"${{ secrets.OPENAI_API_KEY }}\"}" > "$CODEX_HOME/auth.json"
+
+          # Build analysis context
+          cat > /tmp/analysis_input.md << 'CONTEXT_EOF'
+          # Analysis Input for ${{ inputs.repo }}
+
+          ## Recent Commit Log
+          CONTEXT_EOF
+          cat /tmp/commit-log.txt >> /tmp/analysis_input.md
+
+          cat >> /tmp/analysis_input.md << 'CONTEXT_EOF'
+
+          ## Recent Diff (filtered)
+          CONTEXT_EOF
+          cat /tmp/processed_diff.txt >> /tmp/analysis_input.md
+
+          cat >> /tmp/analysis_input.md << 'CONTEXT_EOF'
+
+          ## Recent PRs (from GitHub API)
+          CONTEXT_EOF
+          cat /tmp/api-data/pulls.json >> /tmp/analysis_input.md
+
+          cat >> /tmp/analysis_input.md << 'CONTEXT_EOF'
+
+          ## Recent Issues (from GitHub API)
+          CONTEXT_EOF
+          cat /tmp/api-data/issues.json >> /tmp/analysis_input.md
+
+          cat >> /tmp/analysis_input.md << 'CONTEXT_EOF'
+
+          ## Historical Context
+          CONTEXT_EOF
+          cat /tmp/historical_context.md >> /tmp/analysis_input.md
+
+          # Run Codex
+          PROMPT=$(cat .codex-actions/.github/prompts/repo-tracker.md)
+          FULL_PROMPT="$PROMPT
+
+          ---
+
+          $(cat /tmp/analysis_input.md)"
+
+          codex exec --skip-git-repo-check --full-auto --output-last-message /tmp/codex-output.json "$FULL_PROMPT" || true
+
+      - name: Update Markdown report
+        id: update-report
+        uses: actions/github-script@v7
+        env:
+          REPO_INPUT: ${{ inputs.repo }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const repoInput = process.env.REPO_INPUT;
+            const [owner, repo] = repoInput.split('/');
+            const reportDir = `reports/${owner}`;
+            const reportPath = `${reportDir}/${repo}.md`;
+            const today = new Date().toISOString().split('T')[0];
+
+            // Parse Codex output
+            let analysis = { opportunities: [], notable_changes: [], summary: 'No analysis available', no_significant_activity: true };
+            try {
+              if (fs.existsSync('/tmp/codex-output.json')) {
+                const raw = fs.readFileSync('/tmp/codex-output.json', 'utf8').trim();
+                analysis = JSON.parse(raw);
+              }
+            } catch (e) {
+              console.log('Failed to parse Codex output:', e.message);
+            }
+
+            // Generate opportunity IDs
+            let idCounter = 1;
+            const opportunities = (analysis.opportunities || []).map(opp => ({
+              ...opp,
+              id: `R-${today}-${String(idCounter++).padStart(2, '0')}`
+            }));
+
+            // Build today's entry
+            let todayEntry = `## ${today}\n`;
+            todayEntry += `**Summary:** ${analysis.summary || 'No significant activity'}\n\n`;
+
+            if (opportunities.length > 0) {
+              todayEntry += `### Opportunities Identified\n\n`;
+              for (const opp of opportunities) {
+                const priority = opp.research_potential === 'high' ? 'HIGH' : opp.research_potential === 'medium' ? 'MED' : 'LOW';
+                todayEntry += `#### [${priority}] ${opp.title} (ID: ${opp.id})\n`;
+                todayEntry += `- **Type:** \`${opp.type}\`\n`;
+                todayEntry += `- **Evidence:** ${(opp.evidence || []).join(', ')}\n`;
+                todayEntry += `- **Description:** ${opp.description}\n`;
+                todayEntry += `- **Suggested Action:**\n`;
+                todayEntry += `  - [ ] ${opp.suggested_action}\n\n`;
+              }
+            } else if (analysis.no_significant_activity) {
+              todayEntry += `_No significant activity detected._\n\n`;
+            }
+
+            if ((analysis.notable_changes || []).length > 0) {
+              todayEntry += `### Notable Changes\n\n`;
+              for (const change of analysis.notable_changes) {
+                todayEntry += `- **${change.type}** ${change.ref}: ${change.summary}\n`;
+              }
+              todayEntry += '\n';
+            }
+
+            todayEntry += `---\n\n`;
+
+            // Create or update report
+            fs.mkdirSync(reportDir, { recursive: true });
+
+            let existingContent = '';
+            let existingBacklogItems = [];
+            let existingEntries = '';
+
+            if (fs.existsSync(reportPath)) {
+              existingContent = fs.readFileSync(reportPath, 'utf8');
+
+              // Parse existing backlog items (preserve status and checked state)
+              const backlogMatch = existingContent.match(/## Active Research Backlog[\s\S]*?(?=---\n\n## \d{4}|$)/);
+              if (backlogMatch) {
+                const backlogText = backlogMatch[0];
+                // Match backlog items: - **[PRIORITY] ID: Title**\n  - Status: X\n  - Action: [ ] or [x] action
+                const itemRegex = /- \*\*\[(\w+)\] (R-[\d-]+): (.+?)\*\*\n\s+- Status: (\w+)\n\s+- Action: \[([ x])\] (.+?)(?=\n\n|- \*\*\[|$)/gs;
+                let match;
+                while ((match = itemRegex.exec(backlogText)) !== null) {
+                  existingBacklogItems.push({
+                    priority: match[1],
+                    id: match[2],
+                    title: match[3],
+                    status: match[4],
+                    checked: match[5] === 'x',
+                    action: match[6].trim()
+                  });
+                }
+              }
+
+              // Get entries after backlog
+              const entriesMatch = existingContent.match(/---\n\n(## \d{4}[\s\S]*)/);
+              if (entriesMatch) {
+                existingEntries = entriesMatch[1];
+              }
+            }
+
+            // Build merged backlog: new items + existing incomplete items
+            let backlog = `## Active Research Backlog\n`;
+            backlog += `*(Aggregated action items from daily logs)*\n\n`;
+
+            // Add new opportunities first
+            const newIds = new Set(opportunities.map(o => o.id));
+            for (const opp of opportunities) {
+              const priority = opp.research_potential === 'high' ? 'HIGH' : opp.research_potential === 'medium' ? 'MED' : 'LOW';
+              backlog += `- **[${priority}] ${opp.id}: ${opp.title}**\n`;
+              backlog += `  - Status: Todo\n`;
+              backlog += `  - Action: [ ] ${opp.suggested_action}\n\n`;
+            }
+
+            // Preserve existing items that aren't duplicates and aren't marked Done with checked action
+            for (const item of existingBacklogItems) {
+              if (!newIds.has(item.id)) {
+                // Keep item unless it's Done AND action is checked
+                if (!(item.status === 'Done' && item.checked)) {
+                  backlog += `- **[${item.priority}] ${item.id}: ${item.title}**\n`;
+                  backlog += `  - Status: ${item.status}\n`;
+                  backlog += `  - Action: [${item.checked ? 'x' : ' '}] ${item.action}\n\n`;
+                }
+              }
+            }
+
+            backlog += `---\n\n`;
+
+            // Build final report
+            let finalReport = `# ${repo} Research Tracker\n\n`;
+            finalReport += backlog;
+            finalReport += todayEntry;
+
+            if (existingEntries) {
+              // Remove today's entry if it exists (same-day rerun), keep older entries
+              const withoutToday = existingEntries.replace(new RegExp(`^## ${today}[\\s\\S]*?---\\n\\n`, 'm'), '');
+              finalReport += withoutToday;
+            }
+
+            fs.writeFileSync(reportPath, finalReport);
+
+            // Output for webhook
+            core.setOutput('report_path', reportPath);
+            core.setOutput('analysis_json', JSON.stringify(analysis));
+            core.setOutput('opportunities_count', opportunities.length);
+
+      - name: Commit and push
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          OWNER=$(echo "${{ inputs.repo }}" | cut -d'/' -f1)
+          REPO=$(echo "${{ inputs.repo }}" | cut -d'/' -f2)
+
+          git add "reports/$OWNER/$REPO.md" || true
+          git diff --staged --quiet || git commit -m "chore(tracker): update ${{ inputs.repo }} analysis"
+          git push
+
+      - name: Send webhook
+        if: inputs.webhook_url != ''
+        env:
+          WEBHOOK_URL: ${{ inputs.webhook_url }}
+          REPO_INPUT: ${{ inputs.repo }}
+          ANALYSIS_JSON: ${{ steps.update-report.outputs.analysis_json }}
+          REPORT_PATH: ${{ steps.update-report.outputs.report_path }}
+        run: |
+          TODAY=$(date +%Y-%m-%d)
+
+          cat > /tmp/webhook_payload.json << EOF
+          {
+            "type": "repo_analysis",
+            "repo": "$REPO_INPUT",
+            "analysis_date": "$TODAY",
+            "summary": $(echo "$ANALYSIS_JSON" | jq -r '.summary // "No summary"' | jq -Rs .),
+            "opportunities": $(echo "$ANALYSIS_JSON" | jq '.opportunities // []'),
+            "report_url": "https://github.com/${{ github.repository }}/blob/main/$REPORT_PATH"
+          }
+          EOF
+
+          curl -s -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/webhook_payload.json || echo "Webhook failed"

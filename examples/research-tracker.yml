@@ -1,0 +1,27 @@
+# Example: Research Tracker Caller Workflow
+# Copy this to .github/workflows/research-tracker.yml in your repository
+
+name: Research Tracker
+
+on:
+  schedule:
+    - cron: '0 8 * * *'  # Daily at 8am UTC
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: 'Override repo list (comma-separated)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  track:
+    uses: MonteYin/codex-actions/.github/workflows/reusable-tracker-dispatcher.yml@main
+    with:
+      repos: ${{ inputs.repos || vars.WATCHED_REPOS }}
+      webhook_url: ${{ vars.WEBHOOK_URL }}
+      lookback_hours: 24
+    secrets: inherit
