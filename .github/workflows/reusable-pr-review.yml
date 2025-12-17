@@ -110,6 +110,8 @@ jobs:
 
             for (const f of findings) {
               if (!f.code_location?.absolute_file_path || !f.code_location?.line_range?.start) continue;
+              // Only post comments for high-confidence (>80%) P0/P1 issues
+              if (f.confidence_score <= 0.80 || (f.priority !== 0 && f.priority !== 1)) continue;
 
               let body = `**${f.title}**\n\n${f.body}\n\n`;
               if (f.suggestion) body += `**Suggested fix:**\n\`\`\`suggestion\n${f.suggestion}\n\`\`\`\n\n`;

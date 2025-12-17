@@ -1,0 +1,273 @@
+name: Reusable Tracker Dispatcher
+
+on:
+  workflow_call:
+    inputs:
+      repos:
+        description: "Comma-separated list of repos (owner/repo)"
+        type: string
+        required: true
+      webhook_url:
+        description: "Webhook URL for summary"
+        type: string
+        required: false
+        default: ""
+      lookback_hours:
+        description: "Hours to look back for activity"
+        type: number
+        required: false
+        default: 24
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+      OPENAI_BASE_URL:
+        required: false
+      CODEX_MODEL:
+        required: false
+      CODEX_REASONING_EFFORT:
+        required: false
+
+jobs:
+  prepare:
+    name: Prepare repo matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.parse.outputs.matrix }}
+    steps:
+      - name: Parse repo list
+        id: parse
+        run: |
+          REPOS='${{ inputs.repos }}'
+          # Convert comma-separated to JSON array (compact output for GITHUB_OUTPUT)
+          JSON_ARRAY=$(echo "$REPOS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' | jq -R . | jq -s -c .)
+          echo "matrix={\"repo\":$JSON_ARRAY}" >> "$GITHUB_OUTPUT"
+
+  analyze:
+    name: Analyze
+    needs: prepare
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    uses: ./.github/workflows/reusable-repo-tracker.yml
+    with:
+      repo: ${{ matrix.repo }}
+      webhook_url: ${{ inputs.webhook_url }}
+      lookback_hours: ${{ inputs.lookback_hours }}
+    secrets: inherit
+
+  collect-failures-1:
+    name: Collect failures (round 1)
+    needs: [prepare, analyze]
+    if: failure()
+    runs-on: ubuntu-latest
+    outputs:
+      failed_repos: ${{ steps.collect.outputs.failed_repos }}
+      has_failures: ${{ steps.collect.outputs.has_failures }}
+    steps:
+      - name: Collect failed repos
+        id: collect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Get failed jobs and output as JSON array
+          # Extract owner/repo pattern robustly from job names
+          FAILED_JSON=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
+            --jq '[.jobs[] | select(.name | startswith("Analyze")) | select(.conclusion == "failure") | .name | capture("(?<repo>[^/ ]+/[^/ ]+)$").repo]')
+
+          if [ "$FAILED_JSON" != "[]" ] && [ -n "$FAILED_JSON" ]; then
+            echo "failed_repos=$FAILED_JSON" >> $GITHUB_OUTPUT
+            echo "has_failures=true" >> $GITHUB_OUTPUT
+          else
+            echo "failed_repos=[]" >> $GITHUB_OUTPUT
+            echo "has_failures=false" >> $GITHUB_OUTPUT
+          fi
+
+  retry-1:
+    name: Retry (round 1)
+    needs: collect-failures-1
+    if: needs['collect-failures-1'].outputs.has_failures == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        repo: ${{ fromJson(needs['collect-failures-1'].outputs.failed_repos) }}
+    uses: ./.github/workflows/reusable-repo-tracker.yml
+    with:
+      repo: ${{ matrix.repo }}
+      webhook_url: ${{ inputs.webhook_url }}
+      lookback_hours: ${{ inputs.lookback_hours }}
+    secrets: inherit
+
+  collect-failures-2:
+    name: Collect failures (round 2)
+    needs: [collect-failures-1, retry-1]
+    if: failure() && needs['collect-failures-1'].outputs.has_failures == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      failed_repos: ${{ steps.collect.outputs.failed_repos }}
+      has_failures: ${{ steps.collect.outputs.has_failures }}
+    steps:
+      - name: Collect failed repos
+        id: collect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Get failed jobs and output as JSON array
+          # Extract owner/repo pattern robustly from job names
+          FAILED_JSON=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
+            --jq '[.jobs[] | select(.name | startswith("Retry (round 1)")) | select(.conclusion == "failure") | .name | capture("(?<repo>[^/ ]+/[^/ ]+)$").repo]')
+
+          if [ "$FAILED_JSON" != "[]" ] && [ -n "$FAILED_JSON" ]; then
+            echo "failed_repos=$FAILED_JSON" >> $GITHUB_OUTPUT
+            echo "has_failures=true" >> $GITHUB_OUTPUT
+          else
+            echo "failed_repos=[]" >> $GITHUB_OUTPUT
+            echo "has_failures=false" >> $GITHUB_OUTPUT
+          fi
+
+  retry-2:
+    name: Retry (round 2)
+    needs: collect-failures-2
+    if: needs['collect-failures-2'].outputs.has_failures == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        repo: ${{ fromJson(needs['collect-failures-2'].outputs.failed_repos) }}
+    uses: ./.github/workflows/reusable-repo-tracker.yml
+    with:
+      repo: ${{ matrix.repo }}
+      webhook_url: ${{ inputs.webhook_url }}
+      lookback_hours: ${{ inputs.lookback_hours }}
+    secrets: inherit
+
+  collect-failures-3:
+    name: Collect failures (final)
+    needs: [collect-failures-2, retry-2]
+    if: always() && needs['collect-failures-2'].outputs.has_failures == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      failed_repos: ${{ steps.collect.outputs.failed_repos }}
+      has_failures: ${{ steps.collect.outputs.has_failures }}
+    steps:
+      - name: Collect failed repos
+        id: collect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Get failed jobs from retry-2 and output as JSON array
+          # Extract owner/repo pattern robustly from job names
+          FAILED_JSON=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
+            --jq '[.jobs[] | select(.name | startswith("Retry (round 2)")) | select(.conclusion == "failure") | .name | capture("(?<repo>[^/ ]+/[^/ ]+)$").repo]')
+
+          if [ "$FAILED_JSON" != "[]" ] && [ -n "$FAILED_JSON" ]; then
+            echo "failed_repos=$FAILED_JSON" >> $GITHUB_OUTPUT
+            echo "has_failures=true" >> $GITHUB_OUTPUT
+          else
+            echo "failed_repos=[]" >> $GITHUB_OUTPUT
+            echo "has_failures=false" >> $GITHUB_OUTPUT
+          fi
+
+  handle-final-failures:
+    name: Handle final failures
+    needs: [collect-failures-3]
+    if: always() && needs['collect-failures-3'].outputs.has_failures == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log failures
+        env:
+          FAILED_REPOS: ${{ needs['collect-failures-3'].outputs.failed_repos }}
+        run: |
+          TODAY=$(date +%Y-%m-%d)
+          mkdir -p reports
+
+          echo "## $TODAY - Failed Repos" >> reports/failures.md
+          echo "" >> reports/failures.md
+          # FAILED_REPOS is JSON array, parse with jq
+          echo "$FAILED_REPOS" | jq -r '.[]' | while read repo; do
+            [ -n "$repo" ] && echo "- $repo" >> reports/failures.md
+          done
+          echo "" >> reports/failures.md
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add reports/failures.md
+          git diff --staged --quiet || git commit -m "chore(tracker): log failed repos for $TODAY"
+          git push || true
+
+      - name: Send failure alert
+        if: inputs.webhook_url != ''
+        env:
+          WEBHOOK_URL: ${{ inputs.webhook_url }}
+          FAILED_REPOS: ${{ needs['collect-failures-3'].outputs.failed_repos }}
+        run: |
+          TODAY=$(date +%Y-%m-%d)
+          # FAILED_REPOS is already JSON array, use directly
+          FAILED_ARRAY=$(echo "$FAILED_REPOS" | jq -c '.')
+
+          curl -s -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"type\": \"alert\",
+              \"level\": \"error\",
+              \"analysis_date\": \"$TODAY\",
+              \"message\": \"Repos failed after 2 retries\",
+              \"failed_repos\": $FAILED_ARRAY,
+              \"run_url\": \"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+            }" || echo "Alert webhook failed"
+
+  summarize:
+    name: Send summary
+    needs: [prepare, analyze, retry-1, retry-2, collect-failures-3, handle-final-failures]
+    if: always() && inputs.webhook_url != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate summary
+        env:
+          WEBHOOK_URL: ${{ inputs.webhook_url }}
+          GH_TOKEN: ${{ github.token }}
+          FAILED_REPOS: ${{ needs['collect-failures-3'].outputs.failed_repos }}
+        run: |
+          TODAY=$(date +%Y-%m-%d)
+
+          # Count results
+          TOTAL=$(echo '${{ inputs.repos }}' | tr ',' '\n' | grep -v '^$' | wc -l | tr -d ' ')
+
+          # Use final failed repos count from collect-failures-3
+          FAILED_COUNT=$(echo "${FAILED_REPOS:-[]}" | jq 'length')
+          SUCCESS_COUNT=$((TOTAL - FAILED_COUNT))
+
+          # Count opportunities from reports
+          HIGH=0
+          MEDIUM=0
+          LOW=0
+
+          if [ -d "reports" ]; then
+            HIGH=$(grep -r "## $TODAY" -A 50 reports/ 2>/dev/null | grep -c "\[HIGH\]" || true)
+            MEDIUM=$(grep -r "## $TODAY" -A 50 reports/ 2>/dev/null | grep -c "\[MED\]" || true)
+            LOW=$(grep -r "## $TODAY" -A 50 reports/ 2>/dev/null | grep -c "\[LOW\]" || true)
+          fi
+
+          curl -s -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"type\": \"daily_summary\",
+              \"analysis_date\": \"$TODAY\",
+              \"repos_analyzed\": $SUCCESS_COUNT,
+              \"repos_failed\": $FAILED_COUNT,
+              \"total_opportunities\": {
+                \"high\": $HIGH,
+                \"medium\": $MEDIUM,
+                \"low\": $LOW
+              },
+              \"run_url\": \"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+            }" || echo "Summary webhook failed"
