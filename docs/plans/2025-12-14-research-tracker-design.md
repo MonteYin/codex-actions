@@ -60,7 +60,7 @@ WEBHOOK_URL = "https://your-webhook.com/..."
 ```
 OPENAI_API_KEY = "sk-..."
 OPENAI_BASE_URL = "" (optional)
-CODEX_MODEL = "gpt-5.2" (optional)
+CODEX_MODEL = "gpt-5.2-codex" (optional)
 ```
 
 ## Workflow Specifications

@@ -5,7 +5,7 @@
 #   - OPENAI_API_KEY
 # Optional secrets:
 #   - OPENAI_BASE_URL
-#   - CODEX_MODEL (default: gpt-5.2)
+#   - CODEX_MODEL (default: gpt-5.2-codex)
 #   - CODEX_REASONING_EFFORT (default: xhigh)
 
 name: Codex Automation
