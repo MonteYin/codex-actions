@@ -45,12 +45,6 @@ jobs:
       enable_dedupe: true
     secrets: inherit
 
-  # Issue Response - Auto-respond to new issues
-  issue-response:
-    if: github.event_name == 'issues'
-    uses: ./.github/workflows/reusable-issue-auto-response.yml
-    secrets: inherit
-
   # Mention Response - Respond to @codex mentions
   # Security: Only OWNER/MEMBER/COLLABORATOR can trigger, Bots excluded
   mention-response:

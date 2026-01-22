@@ -10,7 +10,6 @@ A collection of GitHub automation workflows powered by OpenAI Codex CLI, providi
 | `reusable-pr-label.yml` | PR Label | Auto-label PRs based on content |
 | `reusable-pr-description.yml` | PR Description | Auto-enhance PR descriptions |
 | `reusable-issue-triage.yml` | Issue Label / Issue Dedupe | Classification + duplicate detection |
-| `reusable-issue-auto-response.yml` | Issue Response | Auto-respond to new issues |
 | `reusable-mention-responder.yml` | Mention Response | Respond to @codex mentions |
 | `reusable-issue-stale-cleanup.yml` | Issue Stale Cleanup | Clean up inactive issues |
 
@@ -124,13 +123,6 @@ secrets: inherit
 uses: MonteYin/codex-actions/.github/workflows/reusable-issue-triage.yml@v1
 with:
   enable_dedupe: true  # optional
-secrets: inherit
-```
-
-### Issue Response
-
-```yaml
-uses: MonteYin/codex-actions/.github/workflows/reusable-issue-auto-response.yml@v1
 secrets: inherit
 ```
 
