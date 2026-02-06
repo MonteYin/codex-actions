@@ -1,0 +1,212 @@
+name: Reusable Code Scan
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: 'Runner to use (leave empty for auto-detect)'
+        type: string
+        default: ''
+      scan_paths:
+        description: 'Repository paths to scan (space-separated)'
+        type: string
+        default: '.'
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+      OPENAI_BASE_URL:
+        required: false
+      CODEX_MODEL:
+        required: false
+      CODEX_REASONING_EFFORT:
+        required: false
+
+jobs:
+  code-scan:
+    name: Code Scan
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.repository_visibility == 'private' && fromJSON('["self-hosted", "linux", "x64"]') || 'ubuntu-latest') }}
+    container:
+      image: node:20-bullseye
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Checkout prompts
+        uses: actions/checkout@v4
+        with:
+          repository: MonteYin/codex-actions
+          path: .codex-actions
+          sparse-checkout: .github/prompts
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          apt-get update && apt-get install -y jq curl
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          apt-get update && apt-get install -y gh
+          npm install -g @openai/codex
+
+      - name: Fetch existing code-scan issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue list --repo "${{ github.repository }}" --label code-scan --state open --json number,body --limit 200 > /tmp/existing-issues.json || echo "[]" > /tmp/existing-issues.json
+
+      - name: Run Codex
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+          SCAN_PATHS: ${{ inputs.scan_paths }}
+        shell: bash
+        run: |
+          mkdir -p "$CODEX_HOME"
+          MODEL="${{ secrets.CODEX_MODEL }}"
+          MODEL="${MODEL:-gpt-5.3-codex}"
+          EFFORT="${{ secrets.CODEX_REASONING_EFFORT }}"
+          EFFORT="${EFFORT:-xhigh}"
+          cat > "$CODEX_HOME/config.toml" << TOML
+          model = "$MODEL"
+          model_reasoning_effort = "$EFFORT"
+          TOML
+          echo "{\"OPENAI_API_KEY\": \"${{ secrets.OPENAI_API_KEY }}\"}" > "$CODEX_HOME/auth.json"
+
+          PROMPT=$(cat .codex-actions/.github/prompts/code-scan.md)
+          PROMPT="${PROMPT//\$\{SCAN_PATHS\}/$SCAN_PATHS}"
+          codex exec --skip-git-repo-check --full-auto --output-last-message /tmp/codex-output.json "$PROMPT" || true
+
+      - name: Process scan results
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const crypto = require('crypto');
+
+            if (!fs.existsSync('/tmp/codex-output.json')) return;
+
+            const output = fs.readFileSync('/tmp/codex-output.json', 'utf8').trim();
+            if (!output) return;
+
+            let result;
+            try {
+              result = JSON.parse(output);
+            } catch (e) {
+              console.log('Failed to parse codex output as JSON.');
+              return;
+            }
+
+            let existingIssues = [];
+            if (fs.existsSync('/tmp/existing-issues.json')) {
+              const existingRaw = fs.readFileSync('/tmp/existing-issues.json', 'utf8').trim();
+              if (existingRaw) {
+                try {
+                  existingIssues = JSON.parse(existingRaw);
+                } catch (e) {
+                  existingIssues = [];
+                }
+              }
+            }
+
+            const fingerprintRegex = /<!-- fingerprint:(\w+) -->/;
+            const existingFingerprints = new Set();
+            for (const existing of existingIssues) {
+              const match = (existing.body || '').match(fingerprintRegex);
+              if (match?.[1]) existingFingerprints.add(match[1]);
+            }
+
+            try {
+              await github.rest.issues.getLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'code-scan'
+              });
+            } catch (e) {
+              if (e.status === 404) {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: 'code-scan',
+                  description: 'Automated code scan findings',
+                  color: 'B60205'
+                });
+              } else {
+                throw e;
+              }
+            }
+
+            const issues = Array.isArray(result.issues) ? result.issues : [];
+
+            const normalizeFingerprint = (issue) => {
+              const raw = String(issue.fingerprint || '').trim();
+              if (/^\w+$/.test(raw)) return raw;
+
+              const basis = [issue.file_path || '', issue.category || '', issue.title || '', issue.body || ''].join('|');
+              return crypto.createHash('sha256').update(basis).digest('hex').slice(0, 16);
+            };
+
+            let createdCount = 0;
+
+            for (const issue of issues) {
+              const confidence = Number(issue.confidence_score);
+              const priority = Number(issue.priority);
+
+              if (!(confidence > 0.80)) continue;
+              if (!Number.isFinite(priority) || priority > 1) continue;
+
+              const fingerprint = normalizeFingerprint(issue);
+              if (existingFingerprints.has(fingerprint)) continue;
+
+              const filePath = String(issue.file_path || '').trim() || 'unknown';
+              const lineStart = Number(issue.line_range?.start) > 0 ? Number(issue.line_range.start) : 1;
+              const lineEndRaw = Number(issue.line_range?.end);
+              const lineEnd = lineEndRaw >= lineStart ? lineEndRaw : lineStart;
+              const title = String(issue.title || '').trim() || `Code scan finding in ${filePath}`;
+              const category = String(issue.category || 'logic').trim();
+              const body = String(issue.body || '').trim() || 'No details provided by scanner.';
+              const suggestion = String(issue.suggestion || '').trim() || 'Review and apply a safe fix for this finding.';
+              const confidencePct = (confidence * 100).toFixed(0);
+
+              const issueBody = [
+                `## ${title}`,
+                `**File**: \`${filePath}\` (lines ${lineStart}-${lineEnd})`,
+                `**Priority**: P${priority} | **Confidence**: ${confidencePct}%`,
+                `**Category**: ${category}`,
+                '',
+                body,
+                '',
+                '### Suggested Fix',
+                suggestion,
+                '',
+                '---',
+                '_Automated by Codex Code Scan_',
+                `<!-- fingerprint:${fingerprint} -->`
+              ].join('\n');
+
+              try {
+                await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title,
+                  body: issueBody,
+                  labels: ['code-scan']
+                });
+                existingFingerprints.add(fingerprint);
+                createdCount += 1;
+              } catch (e) {
+                console.log(`Failed to create issue for ${filePath}: ${e.message}`);
+              }
+            }
+
+            console.log(`Processed ${issues.length} findings, created ${createdCount} issues.`);

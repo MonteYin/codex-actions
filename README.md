@@ -12,6 +12,7 @@ A collection of GitHub automation workflows powered by OpenAI Codex CLI, providi
 | `reusable-issue-triage.yml` | Issue Label / Issue Dedupe | Classification + duplicate detection |
 | `reusable-mention-responder.yml` | Mention Response | Respond to @codex mentions |
 | `reusable-issue-stale-cleanup.yml` | Issue Stale Cleanup | Clean up inactive issues |
+| `reusable-code-scan.yml` | Code Scan | Scheduled codebase scanning with auto issue creation |
 
 ## Versioning
 
@@ -145,6 +146,17 @@ with:
 secrets: inherit
 ```
 
+### Code Scan
+
+Scheduled codebase scanning that automatically creates GitHub issues for detected defects (one issue per finding). Uses fingerprint-based deduplication to avoid duplicates across runs.
+
+```yaml
+uses: MonteYin/codex-actions/.github/workflows/reusable-code-scan.yml@v1
+with:
+  scan_paths: '.'  # optional, space-separated paths
+secrets: inherit
+```
+
 ### Research Tracker
 
 Track AI/ML repositories for research opportunities.
@@ -209,7 +221,7 @@ codex-actions/
 ├── .github/
 │   ├── workflows/
 │   │   ├── codex.yml           # This repo's workflow
-│   │   └── reusable-*.yml      # Reusable workflows (7)
+│   │   └── reusable-*.yml      # Reusable workflows (8)
 │   ├── prompts/                # AI prompts
 │   └── ISSUE_TEMPLATE/         # Issue templates
 ├── examples/
