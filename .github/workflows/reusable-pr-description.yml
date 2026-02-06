@@ -110,7 +110,7 @@ jobs:
         run: |
           mkdir -p "$CODEX_HOME"
           MODEL="${{ secrets.CODEX_MODEL }}"
-          MODEL="${MODEL:-gpt-5.2}"
+          MODEL="${MODEL:-gpt-5.3-codex}"
           EFFORT="${{ secrets.CODEX_REASONING_EFFORT }}"
           EFFORT="${EFFORT:-xhigh}"
           cat > "$CODEX_HOME/config.toml" << TOML
