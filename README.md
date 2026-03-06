@@ -38,7 +38,7 @@ Settings → Secrets and variables → Actions → Repository secrets
 |--------|----------|---------|-------------|
 | `OPENAI_API_KEY` | ✅ | - | OpenAI API key |
 | `OPENAI_BASE_URL` | ❌ | - | Custom API endpoint |
-| `CODEX_MODEL` | ❌ | `gpt-5.3-codex` | Model for Codex |
+| `CODEX_MODEL` | ❌ | `gpt-5.4` | Model for Codex |
 | `CODEX_REASONING_EFFORT` | ❌ | `xhigh` | Reasoning effort level |
 
 ### 2. Add Workflow
@@ -205,7 +205,7 @@ jobs:
 |--------|----------|---------|-------------|
 | `OPENAI_API_KEY` | ✅ | - | OpenAI API key |
 | `OPENAI_BASE_URL` | ❌ | - | Custom API endpoint |
-| `CODEX_MODEL` | ❌ | `gpt-5.3-codex` | Model for Codex |
+| `CODEX_MODEL` | ❌ | `gpt-5.4` | Model for Codex |
 | `CODEX_REASONING_EFFORT` | ❌ | `xhigh` | Reasoning effort level |
 
 ### Optional Inputs
